@@ -2,7 +2,7 @@
 // © leomo19960205
 
 //@version=5
-strategy("BTC 3m EMA20 Imbalance + A 3-Wave Short v0.2", overlay=true, initial_capital=10000, pyramiding=0, default_qty_type=strategy.percent_of_equity, default_qty_value=100, margin_long=100, margin_short=100, commission_type=strategy.commission.percent, commission_value=0.04, process_orders_on_close=true, calc_on_every_tick=false)
+strategy("BTC 3m EMA20 Imbalance + A 3-Wave Short v0.2", overlay=true, initial_capital=10000, pyramiding=0, default_qty_type=strategy.percent_of_equity, default_qty_value=95, commission_type=strategy.commission.percent, commission_value=0.04, process_orders_on_close=true, calc_on_every_tick=false)
 
 // =====================================================
 // V0.2 = V0.1 EMA20失衡衰竭策略 + A版激进三波分布衰竭空
@@ -234,23 +234,21 @@ if longSignalV01
     activeLongStop := longStopV01
     activeLongTarget := longTargetV01
     strategy.entry("L-V01", strategy.long, comment="V0.1 EMA20 exhaustion long")
+    strategy.exit("LX", from_entry="L-V01", stop=longStopV01, limit=longTargetV01)
 
 if shortSignalA
     activeShortStop := shortStopA
     activeShortTarget := shortTargetA
     strategy.entry("S-A3", strategy.short, comment="A 3-wave distribution short")
+    strategy.exit("SX-A3", from_entry="S-A3", stop=shortStopA, limit=shortTargetA)
 else if shortSignalV01
     activeShortStop := shortStopV01
     activeShortTarget := shortTargetV01
     strategy.entry("S-V01", strategy.short, comment="V0.1 EMA20 exhaustion short")
+    strategy.exit("SX-V01", from_entry="S-V01", stop=shortStopV01, limit=shortTargetV01)
 
-if strategy.position_size > 0
-    strategy.exit("LX", stop=activeLongStop, limit=activeLongTarget)
 
-if strategy.position_size < 0
-    strategy.exit("SX", stop=activeShortStop, limit=activeShortTarget)
-
-if strategy.position_size == 0
+if strategy.position_size == 0 and strategy.position_size[1] != 0
     activeLongStop := na
     activeLongTarget := na
     activeShortStop := na
@@ -259,6 +257,11 @@ if strategy.position_size == 0
 // =====================================================
 // Visuals and alerts
 // =====================================================
+plot(strategy.position_size > 0 ? activeLongStop : na, "Long stop", color=color.red, style=plot.style_linebr)
+plot(strategy.position_size > 0 ? activeLongTarget : na, "Long target", color=color.green, style=plot.style_linebr)
+plot(strategy.position_size < 0 ? activeShortStop : na, "Short stop", color=color.red, style=plot.style_linebr)
+plot(strategy.position_size < 0 ? activeShortTarget : na, "Short target", color=color.green, style=plot.style_linebr)
+
 plotshape(longSignalV01, title="V0.1 Long", style=shape.triangleup, location=location.belowbar, size=size.small, text="L1")
 plotshape(shortSignalV01, title="V0.1 Short", style=shape.triangledown, location=location.abovebar, size=size.small, text="S1")
 plotshape(shortSignalA, title="A版三波衰竭空", style=shape.triangledown, location=location.abovebar, size=size.normal, text="A空")
