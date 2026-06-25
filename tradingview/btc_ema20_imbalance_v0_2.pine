@@ -1,0 +1,274 @@
+//@version=5
+strategy("BTC 3m EMA20 Imbalance + A 3-Wave Short v0.2", overlay=true, initial_capital=10000, pyramiding=0, commission_type=strategy.commission.percent, commission_value=0.04, process_orders_on_close=true, calc_on_every_tick=false)
+
+// =====================================================
+// V0.2 = V0.1 EMA20失衡衰竭策略 + A版激进三波分布衰竭空
+//
+// A版含义：
+// - 前面涨了很多；
+// - 高位横盘 / 分布；
+// - 出现三次上攻；
+// - 第三波上攻没有有效打开新空间；
+// - 第三波出现上影线/失败迹象；
+// - 收回 EMA20 下方后，提前做空。
+//
+// 注意：A版不等跌破箱体下沿，属于激进提前空。
+// =====================================================
+
+// =============================
+// Inputs: general
+// =============================
+tradeMode = input.string("Both", "Trade direction", options=["Both", "Long only", "Short only"])
+enableV01 = input.bool(true, "Enable V0.1 EMA20 imbalance signals")
+enableA3Short = input.bool(true, "Enable A-version 3-wave distribution short")
+
+emaLen = input.int(20, "EMA length", minval=1)
+ema50Len = input.int(50, "EMA50 length", minval=1)
+ema200Len = input.int(200, "EMA200 length", minval=1)
+atrLen = input.int(14, "ATR length", minval=1)
+showScores = input.bool(true, "Show signal scores")
+
+// =============================
+// Inputs: V0.1 EMA20 imbalance module
+// =============================
+trendLookback = input.int(36, "V0.1 imbalance lookback bars", minval=10)
+minAgeBars = input.int(14, "V0.1 minimum one-sided bars", minval=3)
+maxCrossCount = input.float(4.0, "V0.1 max EMA crosses in lookback", minval=0.0, step=1.0)
+minRangeATR = input.float(1.8, "V0.1 minimum range / ATR", minval=0.1, step=0.1)
+minExtensionATR = input.float(1.2, "V0.1 minimum extension from EMA / ATR", minval=0.1, step=0.1)
+touchDistanceATR = input.float(0.45, "V0.1 near EMA distance / ATR", minval=0.05, step=0.05)
+slopeNowBars = input.int(6, "V0.1 EMA slope recent bars", minval=1)
+slopePastBars = input.int(20, "V0.1 EMA slope past bars", minval=2)
+minPastSlopeATR = input.float(0.35, "V0.1 minimum past EMA slope / ATR", minval=0.01, step=0.01)
+flattenRatio = input.float(0.55, "V0.1 flatten ratio", minval=0.05, maxval=1.0, step=0.05)
+wickRatioMin = input.float(0.28, "V0.1 rejection wick ratio", minval=0.0, maxval=1.0, step=0.01)
+entryScoreMin = input.float(70.0, "V0.1 minimum entry score", minval=0.0, maxval=100.0, step=1.0)
+
+// =============================
+// Inputs: A-version 3-wave distribution short module
+// =============================
+impulseLookbackA = input.int(96, "A prior rise lookback bars", minval=20)
+minImpulseATRA = input.float(5.0, "A minimum prior rise / ATR", minval=0.5, step=0.5)
+aboveRatioMinA = input.float(0.55, "A above EMA20 ratio in prior rise", minval=0.1, maxval=1.0, step=0.05)
+
+pivotLeftA = input.int(3, "A pivot left bars", minval=1)
+pivotRightA = input.int(3, "A pivot right bars", minval=1)
+minWaveSpacingA = input.int(5, "A minimum bars between wave highs", minval=1)
+minPatternBarsA = input.int(18, "A minimum 3-wave duration", minval=3)
+maxPatternBarsA = input.int(96, "A maximum 3-wave duration", minval=10)
+waveHighToleranceATRA = input.float(1.2, "A wave high cluster tolerance / ATR", minval=0.1, step=0.1)
+falseBreakATRA = input.float(0.6, "A allowed 3rd-wave false break / ATR", minval=0.0, step=0.1)
+
+emaSlopeBarsA = input.int(12, "A EMA20 flatten bars", minval=2)
+maxFlatSlopeATRA = input.float(0.45, "A max EMA20 slope while distributing / ATR", minval=0.01, step=0.01)
+thirdWickMinA = input.float(0.25, "A minimum 3rd-wave upper wick ratio", minval=0.0, maxval=1.0, step=0.01)
+requireCloseBelowEma20A = input.bool(true, "A trigger requires close below EMA20")
+requireBearCandleA = input.bool(true, "A trigger requires bearish candle")
+
+// =============================
+// Inputs: risk model
+// =============================
+stopLookback = input.int(8, "V0.1 stop swing lookback", minval=2)
+stopATRBuffer = input.float(0.18, "V0.1 stop ATR buffer", minval=0.0, step=0.01)
+rrTarget = input.float(3.0, "Take profit RR", minval=0.5, step=0.5)
+minRiskATR = input.float(0.25, "Minimum risk / ATR", minval=0.01, step=0.01)
+maxRiskATR = input.float(2.2, "V0.1 maximum risk / ATR", minval=0.1, step=0.1)
+stopATRBufferA = input.float(0.25, "A stop buffer / ATR", minval=0.0, step=0.05)
+maxRiskATRA = input.float(3.0, "A maximum risk / ATR", minval=0.1, step=0.1)
+
+// =============================
+// Helpers
+// =============================
+f_clamp(x, lo, hi) =>
+    math.max(lo, math.min(hi, x))
+
+f_score(x, lo, hi) =>
+    hi == lo ? 0.0 : f_clamp((x - lo) / (hi - lo), 0.0, 1.0)
+
+f_barRange(offset) =>
+    math.max(high[offset] - low[offset], syminfo.mintick)
+
+f_upperWickRatio(offset) =>
+    (high[offset] - math.max(open[offset], close[offset])) / f_barRange(offset)
+
+// =============================
+// Base series
+// =============================
+ema20 = ta.ema(close, emaLen)
+ema50 = ta.ema(close, ema50Len)
+ema200 = ta.ema(close, ema200Len)
+atr = ta.atr(atrLen)
+barRange = math.max(high - low, syminfo.mintick)
+bodyTop = math.max(open, close)
+bodyBottom = math.min(open, close)
+upperWickRatio = (high - bodyTop) / barRange
+lowerWickRatio = (bodyBottom - low) / barRange
+
+plot(ema20, "EMA20", color=color.red, linewidth=2)
+plot(ema50, "EMA50", color=color.orange, linewidth=1)
+plot(ema200, "EMA200", color=color.aqua, linewidth=1)
+
+allowLong = tradeMode == "Both" or tradeMode == "Long only"
+allowShort = tradeMode == "Both" or tradeMode == "Short only"
+
+// =====================================================
+// Module 1: V0.1 EMA20 imbalance exhaustion
+// =====================================================
+crossEvent = ta.cross(close, ema20) ? 1.0 : 0.0
+crossCount = ta.sum(crossEvent, trendLookback)
+rangeATR = atr > 0 ? (ta.highest(high, trendLookback) - ta.lowest(low, trendLookback)) / atr : 0.0
+notChoppy = crossCount <= maxCrossCount and rangeATR >= minRangeATR
+
+upAgeRaw = ta.barssince(close < ema20)
+downAgeRaw = ta.barssince(close > ema20)
+upAge = na(upAgeRaw) ? trendLookback + 1 : upAgeRaw
+downAge = na(downAgeRaw) ? trendLookback + 1 : downAgeRaw
+
+emaSlopeNow = atr > 0 ? (ema20 - ema20[slopeNowBars]) / atr : 0.0
+emaSlopePast = atr > 0 ? (ema20[slopeNowBars] - ema20[slopePastBars]) / atr : 0.0
+upFlatten = emaSlopePast > minPastSlopeATR and emaSlopeNow < emaSlopePast * flattenRatio
+downFlatten = emaSlopePast < -minPastSlopeATR and emaSlopeNow > emaSlopePast * flattenRatio
+
+upExtensionATR = atr > 0 ? ta.highest(high - ema20, trendLookback) / atr : 0.0
+downExtensionATR = atr > 0 ? ta.highest(ema20 - low, trendLookback) / atr : 0.0
+
+distanceToEmaATR = atr > 0 ? math.abs(close - ema20) / atr : 10.0
+touchScore = 1.0 - f_clamp(distanceToEmaATR / touchDistanceATR, 0.0, 1.0)
+
+badCandleShort = close < open and close < close[1]
+badCandleLong = close > open and close > close[1]
+
+shortRejectionScore = f_clamp(upperWickRatio / math.max(wickRatioMin, 0.01), 0.0, 1.0)
+longRejectionScore = f_clamp(lowerWickRatio / math.max(wickRatioMin, 0.01), 0.0, 1.0)
+shortAgeScore = f_score(upAge, minAgeBars, trendLookback)
+longAgeScore = f_score(downAge, minAgeBars, trendLookback)
+shortExtensionScore = f_score(upExtensionATR, minExtensionATR, minExtensionATR * 2.0)
+longExtensionScore = f_score(downExtensionATR, minExtensionATR, minExtensionATR * 2.0)
+shortFlattenScore = upFlatten ? 1.0 : 0.0
+longFlattenScore = downFlatten ? 1.0 : 0.0
+shortConfirmScore = badCandleShort ? 1.0 : 0.0
+longConfirmScore = badCandleLong ? 1.0 : 0.0
+
+shortScore = 20.0 * shortAgeScore + 20.0 * shortExtensionScore + 20.0 * shortFlattenScore + 20.0 * touchScore + 10.0 * shortRejectionScore + 10.0 * shortConfirmScore
+longScore = 20.0 * longAgeScore + 20.0 * longExtensionScore + 20.0 * longFlattenScore + 20.0 * touchScore + 10.0 * longRejectionScore + 10.0 * longConfirmScore
+
+longStopV01 = ta.lowest(low, stopLookback) - atr * stopATRBuffer
+shortStopV01 = ta.highest(high, stopLookback) + atr * stopATRBuffer
+longRiskV01 = close - longStopV01
+shortRiskV01 = shortStopV01 - close
+validLongRiskV01 = atr > 0 and longRiskV01 >= atr * minRiskATR and longRiskV01 <= atr * maxRiskATR
+validShortRiskV01 = atr > 0 and shortRiskV01 >= atr * minRiskATR and shortRiskV01 <= atr * maxRiskATR
+longTargetV01 = close + longRiskV01 * rrTarget
+shortTargetV01 = close - shortRiskV01 * rrTarget
+
+longSignalV01 = enableV01 and allowLong and strategy.position_size == 0 and notChoppy and downAge >= minAgeBars and longScore >= entryScoreMin and badCandleLong and validLongRiskV01
+shortSignalV01 = enableV01 and allowShort and strategy.position_size == 0 and notChoppy and upAge >= minAgeBars and shortScore >= entryScoreMin and badCandleShort and validShortRiskV01
+
+// =====================================================
+// Module 2: A-version aggressive 3-wave distribution short
+// =====================================================
+priorLowA = ta.lowest(low, impulseLookbackA)
+priorHighA = ta.highest(high, impulseLookbackA)
+priorRiseATRA = atr > 0 ? (priorHighA - priorLowA) / atr : 0.0
+aboveEmaCountA = ta.sum(close > ema20 ? 1.0 : 0.0, impulseLookbackA)
+aboveEmaRatioA = impulseLookbackA > 0 ? aboveEmaCountA / impulseLookbackA : 0.0
+backgroundRiseA = priorRiseATRA >= minImpulseATRA and aboveEmaRatioA >= aboveRatioMinA
+
+emaSlopeATRA = atr > 0 ? math.abs(ema20 - ema20[emaSlopeBarsA]) / atr : 999.0
+emaFlattenA = emaSlopeATRA <= maxFlatSlopeATRA
+
+phA = ta.pivothigh(high, pivotLeftA, pivotRightA)
+newPivotHighA = not na(phA)
+
+var float ph1A = na
+var float ph2A = na
+var float ph3A = na
+var int ph1BarA = na
+var int ph2BarA = na
+var int ph3BarA = na
+var float ph1WickA = na
+var float ph2WickA = na
+var float ph3WickA = na
+
+if newPivotHighA
+    ph3A := ph2A
+    ph3BarA := ph2BarA
+    ph3WickA := ph2WickA
+    ph2A := ph1A
+    ph2BarA := ph1BarA
+    ph2WickA := ph1WickA
+    ph1A := phA
+    ph1BarA := bar_index - pivotRightA
+    ph1WickA := f_upperWickRatio(pivotRightA)
+
+have3WavesA = not na(ph1A) and not na(ph2A) and not na(ph3A)
+waveSpacingOkA = have3WavesA and (ph2BarA - ph3BarA >= minWaveSpacingA) and (ph1BarA - ph2BarA >= minWaveSpacingA)
+patternBarsA = have3WavesA ? ph1BarA - ph3BarA : 0
+patternDurationOkA = have3WavesA and patternBarsA >= minPatternBarsA and patternBarsA <= maxPatternBarsA
+highClusterATRA = have3WavesA and atr > 0 ? (math.max(ph1A, math.max(ph2A, ph3A)) - math.min(ph1A, math.min(ph2A, ph3A))) / atr : 999.0
+highClusterOkA = highClusterATRA <= waveHighToleranceATRA
+thirdNoStrongBreakA = have3WavesA and atr > 0 and ph1A <= math.max(ph2A, ph3A) + falseBreakATRA * atr
+thirdRejectionA = have3WavesA and ph1WickA >= thirdWickMinA
+emaTriggerOkA = requireCloseBelowEma20A ? close < ema20 : close < ph1A
+bearTriggerOkA = requireBearCandleA ? (close < open and close < close[1]) : close < close[1]
+
+shortStopA = have3WavesA ? ph1A + atr * stopATRBufferA : na
+shortRiskA = have3WavesA ? shortStopA - close : na
+validRiskA = have3WavesA and atr > 0 and shortRiskA >= atr * minRiskATR and shortRiskA <= atr * maxRiskATRA
+shortTargetA = close - shortRiskA * rrTarget
+
+shortSignalA = enableA3Short and allowShort and newPivotHighA and strategy.position_size == 0 and backgroundRiseA and emaFlattenA and have3WavesA and waveSpacingOkA and patternDurationOkA and highClusterOkA and thirdNoStrongBreakA and thirdRejectionA and emaTriggerOkA and bearTriggerOkA and validRiskA
+
+// =====================================================
+// Orders
+// =====================================================
+var float activeLongStop = na
+var float activeLongTarget = na
+var float activeShortStop = na
+var float activeShortTarget = na
+
+if longSignalV01
+    activeLongStop := longStopV01
+    activeLongTarget := longTargetV01
+    strategy.entry("L-V01", strategy.long, comment="V0.1 EMA20 exhaustion long")
+
+if shortSignalA
+    activeShortStop := shortStopA
+    activeShortTarget := shortTargetA
+    strategy.entry("S-A3", strategy.short, comment="A 3-wave distribution short")
+else if shortSignalV01
+    activeShortStop := shortStopV01
+    activeShortTarget := shortTargetV01
+    strategy.entry("S-V01", strategy.short, comment="V0.1 EMA20 exhaustion short")
+
+if strategy.position_size > 0
+    strategy.exit("LX", stop=activeLongStop, limit=activeLongTarget)
+
+if strategy.position_size < 0
+    strategy.exit("SX", stop=activeShortStop, limit=activeShortTarget)
+
+if strategy.position_size == 0
+    activeLongStop := na
+    activeLongTarget := na
+    activeShortStop := na
+    activeShortTarget := na
+
+// =====================================================
+// Visuals and alerts
+// =====================================================
+plotshape(longSignalV01, title="V0.1 Long", style=shape.triangleup, location=location.belowbar, size=size.small, text="L1")
+plotshape(shortSignalV01, title="V0.1 Short", style=shape.triangledown, location=location.abovebar, size=size.small, text="S1")
+plotshape(shortSignalA, title="A版三波衰竭空", style=shape.triangledown, location=location.abovebar, size=size.normal, text="A空")
+
+if showScores and longSignalV01
+    label.new(bar_index, low, "V0.1 L " + str.tostring(longScore, "#.0"), style=label.style_label_up, textcolor=color.white)
+
+if showScores and shortSignalV01
+    label.new(bar_index, high, "V0.1 S " + str.tostring(shortScore, "#.0"), style=label.style_label_down, textcolor=color.white)
+
+if showScores and shortSignalA
+    label.new(bar_index, high, "A空\n3-wave fail\nRisk=" + str.tostring(shortRiskA / atr, "#.00") + " ATR", style=label.style_label_down, textcolor=color.white)
+
+alertcondition(longSignalV01, title="V0.1 EMA20 exhaustion LONG", message="V0.1 BTC EMA20 imbalance exhaustion long signal")
+alertcondition(shortSignalV01, title="V0.1 EMA20 exhaustion SHORT", message="V0.1 BTC EMA20 imbalance exhaustion short signal")
+alertcondition(shortSignalA, title="A-version 3-wave distribution SHORT", message="A-version BTC 3-wave distribution aggressive short signal")
