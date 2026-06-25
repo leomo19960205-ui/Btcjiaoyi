@@ -1,0 +1,161 @@
+//@version=5
+strategy("BTC 3m EMA20 Imbalance Exhaustion v0.1", overlay=true, initial_capital=10000, pyramiding=0, commission_type=strategy.commission.percent, commission_value=0.04, process_orders_on_close=true, calc_on_every_tick=false)
+
+// =============================
+// Core idea
+// - BTC 3m reversal / exhaustion strategy.
+// - Detects a one-sided imbalance along EMA20.
+// - Waits for EMA20 slope to weaken / flatten.
+// - Requires price to return near EMA20.
+// - Confirms with a bad candle against the old trend.
+// =============================
+
+// ---- Inputs
+tradeMode = input.string("Both", "Trade direction", options=["Both", "Long only", "Short only"])
+emaLen = input.int(20, "EMA length", minval=1)
+atrLen = input.int(14, "ATR length", minval=1)
+trendLookback = input.int(36, "Imbalance lookback bars", minval=10)
+minAgeBars = input.int(14, "Minimum one-sided bars", minval=3)
+maxCrossCount = input.float(4.0, "Max EMA crosses in lookback", minval=0.0, step=1.0)
+minRangeATR = input.float(1.8, "Minimum range / ATR", minval=0.1, step=0.1)
+
+minExtensionATR = input.float(1.2, "Minimum extension from EMA / ATR", minval=0.1, step=0.1)
+touchDistanceATR = input.float(0.45, "Near EMA distance / ATR", minval=0.05, step=0.05)
+
+slopeNowBars = input.int(6, "EMA slope recent bars", minval=1)
+slopePastBars = input.int(20, "EMA slope past bars", minval=2)
+minPastSlopeATR = input.float(0.35, "Minimum past EMA slope / ATR", minval=0.01, step=0.01)
+flattenRatio = input.float(0.55, "Flatten ratio", minval=0.05, maxval=1.0, step=0.05)
+
+wickRatioMin = input.float(0.28, "Rejection wick ratio", minval=0.0, maxval=1.0, step=0.01)
+entryScoreMin = input.float(70.0, "Minimum entry score", minval=0.0, maxval=100.0, step=1.0)
+
+stopLookback = input.int(8, "Stop swing lookback", minval=2)
+stopATRBuffer = input.float(0.18, "Stop ATR buffer", minval=0.0, step=0.01)
+rrTarget = input.float(3.0, "Take profit RR", minval=0.5, step=0.5)
+minRiskATR = input.float(0.25, "Minimum risk / ATR", minval=0.01, step=0.01)
+maxRiskATR = input.float(2.2, "Maximum risk / ATR", minval=0.1, step=0.1)
+
+showScores = input.bool(true, "Show signal scores")
+
+// ---- Helpers
+f_clamp(x, lo, hi) =>
+    math.max(lo, math.min(hi, x))
+
+f_score(x, lo, hi) =>
+    hi == lo ? 0.0 : f_clamp((x - lo) / (hi - lo), 0.0, 1.0)
+
+// ---- Base series
+ema20 = ta.ema(close, emaLen)
+atr = ta.atr(atrLen)
+barRange = math.max(high - low, syminfo.mintick)
+bodyTop = math.max(open, close)
+bodyBottom = math.min(open, close)
+upperWickRatio = (high - bodyTop) / barRange
+lowerWickRatio = (bodyBottom - low) / barRange
+
+plot(ema20, "EMA20", color=color.red, linewidth=2)
+
+// ---- Market structure filters
+crossEvent = ta.cross(close, ema20) ? 1.0 : 0.0
+crossCount = ta.sum(crossEvent, trendLookback)
+rangeATR = atr > 0 ? (ta.highest(high, trendLookback) - ta.lowest(low, trendLookback)) / atr : 0.0
+notChoppy = crossCount <= maxCrossCount and rangeATR >= minRangeATR
+
+upAgeRaw = ta.barssince(close < ema20)
+downAgeRaw = ta.barssince(close > ema20)
+upAge = na(upAgeRaw) ? trendLookback + 1 : upAgeRaw
+downAge = na(downAgeRaw) ? trendLookback + 1 : downAgeRaw
+
+// EMA slope measured by ATR units.
+emaSlopeNow = atr > 0 ? (ema20 - ema20[slopeNowBars]) / atr : 0.0
+emaSlopePast = atr > 0 ? (ema20[slopeNowBars] - ema20[slopePastBars]) / atr : 0.0
+
+upFlatten = emaSlopePast > minPastSlopeATR and emaSlopeNow < emaSlopePast * flattenRatio
+downFlatten = emaSlopePast < -minPastSlopeATR and emaSlopeNow > emaSlopePast * flattenRatio
+
+// ---- Imbalance / exhaustion measurements
+upExtensionATR = atr > 0 ? ta.highest(high - ema20, trendLookback) / atr : 0.0
+downExtensionATR = atr > 0 ? ta.highest(ema20 - low, trendLookback) / atr : 0.0
+
+distanceToEmaATR = atr > 0 ? math.abs(close - ema20) / atr : 10.0
+touchScore = 1.0 - f_clamp(distanceToEmaATR / touchDistanceATR, 0.0, 1.0)
+
+badCandleShort = close < open and close < close[1]
+badCandleLong = close > open and close > close[1]
+
+shortRejectionScore = f_clamp(upperWickRatio / math.max(wickRatioMin, 0.01), 0.0, 1.0)
+longRejectionScore = f_clamp(lowerWickRatio / math.max(wickRatioMin, 0.01), 0.0, 1.0)
+
+shortAgeScore = f_score(upAge, minAgeBars, trendLookback)
+longAgeScore = f_score(downAge, minAgeBars, trendLookback)
+
+shortExtensionScore = f_score(upExtensionATR, minExtensionATR, minExtensionATR * 2.0)
+longExtensionScore = f_score(downExtensionATR, minExtensionATR, minExtensionATR * 2.0)
+
+shortFlattenScore = upFlatten ? 1.0 : 0.0
+longFlattenScore = downFlatten ? 1.0 : 0.0
+
+shortConfirmScore = badCandleShort ? 1.0 : 0.0
+longConfirmScore = badCandleLong ? 1.0 : 0.0
+
+// Weighted internal scoring model.
+shortScore = 20.0 * shortAgeScore + 20.0 * shortExtensionScore + 20.0 * shortFlattenScore + 20.0 * touchScore + 10.0 * shortRejectionScore + 10.0 * shortConfirmScore
+longScore = 20.0 * longAgeScore + 20.0 * longExtensionScore + 20.0 * longFlattenScore + 20.0 * touchScore + 10.0 * longRejectionScore + 10.0 * longConfirmScore
+
+allowLong = tradeMode == "Both" or tradeMode == "Long only"
+allowShort = tradeMode == "Both" or tradeMode == "Short only"
+
+// ---- Risk model
+longStop = ta.lowest(low, stopLookback) - atr * stopATRBuffer
+shortStop = ta.highest(high, stopLookback) + atr * stopATRBuffer
+longRisk = close - longStop
+shortRisk = shortStop - close
+validLongRisk = atr > 0 and longRisk >= atr * minRiskATR and longRisk <= atr * maxRiskATR
+validShortRisk = atr > 0 and shortRisk >= atr * minRiskATR and shortRisk <= atr * maxRiskATR
+
+longTarget = close + longRisk * rrTarget
+shortTarget = close - shortRisk * rrTarget
+
+longSignal = allowLong and strategy.position_size == 0 and notChoppy and downAge >= minAgeBars and longScore >= entryScoreMin and badCandleLong and validLongRisk
+shortSignal = allowShort and strategy.position_size == 0 and notChoppy and upAge >= minAgeBars and shortScore >= entryScoreMin and badCandleShort and validShortRisk
+
+var float activeLongStop = na
+var float activeLongTarget = na
+var float activeShortStop = na
+var float activeShortTarget = na
+
+if longSignal
+    activeLongStop := longStop
+    activeLongTarget := longTarget
+    strategy.entry("L", strategy.long, comment="EMA20 exhaustion long")
+
+if shortSignal
+    activeShortStop := shortStop
+    activeShortTarget := shortTarget
+    strategy.entry("S", strategy.short, comment="EMA20 exhaustion short")
+
+if strategy.position_size > 0
+    strategy.exit("LX", from_entry="L", stop=activeLongStop, limit=activeLongTarget)
+
+if strategy.position_size < 0
+    strategy.exit("SX", from_entry="S", stop=activeShortStop, limit=activeShortTarget)
+
+if strategy.position_size == 0
+    activeLongStop := na
+    activeLongTarget := na
+    activeShortStop := na
+    activeShortTarget := na
+
+// ---- Visuals
+plotshape(longSignal, title="Long signal", style=shape.triangleup, location=location.belowbar, size=size.small, text="L")
+plotshape(shortSignal, title="Short signal", style=shape.triangledown, location=location.abovebar, size=size.small, text="S")
+
+if showScores and longSignal
+    label.new(bar_index, low, "L " + str.tostring(longScore, "#.0"), style=label.style_label_up, textcolor=color.white)
+
+if showScores and shortSignal
+    label.new(bar_index, high, "S " + str.tostring(shortScore, "#.0"), style=label.style_label_down, textcolor=color.white)
+
+alertcondition(longSignal, title="BTC EMA20 exhaustion LONG", message="BTC EMA20 imbalance exhaustion long signal")
+alertcondition(shortSignal, title="BTC EMA20 exhaustion SHORT", message="BTC EMA20 imbalance exhaustion short signal")
